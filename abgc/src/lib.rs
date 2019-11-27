@@ -8,7 +8,7 @@ use std::{
     alloc::{alloc, dealloc, Layout},
     mem::{align_of, forget, size_of},
     ops::Deref,
-    ptr,
+    ptr::{self, NonNull},
 };
 
 /// Since Rust's alloc system requires us to tell it the `Layout` of a region of memory upon
@@ -20,7 +20,7 @@ pub trait GcLayout {
 
 #[derive(Debug)]
 pub struct Gc<T: GcLayout> {
-    objptr: *mut T,
+    objptr: NonNull<T>,
 }
 
 impl<T: GcLayout> Gc<T> {
@@ -28,7 +28,7 @@ impl<T: GcLayout> Gc<T> {
     pub fn new(v: T) -> Self {
         let objptr = Gc::<T>::alloc_blank(Layout::new::<T>());
         let gc = unsafe {
-            objptr.copy_from_nonoverlapping(&v, 1);
+            objptr.as_ptr().copy_from_nonoverlapping(&v, 1);
             Gc::from_raw(objptr)
         };
         forget(v);
@@ -37,7 +37,7 @@ impl<T: GcLayout> Gc<T> {
 
     /// Allocate memory sufficient to `l` (i.e. correctly aligned and of at least the required
     /// size). The returned pointer must be passed to `Gc::from_raw`.
-    pub fn alloc_blank(l: Layout) -> *mut T {
+    pub fn alloc_blank(l: Layout) -> NonNull<T> {
         let (layout, uoff) = Layout::new::<usize>().extend(l).unwrap();
         // In order for our storage scheme to work, it's necessary that `uoff - sizeof::<usize>()`
         // gives a valid alignment for a `usize`. There are only two cases we need to consider
@@ -57,14 +57,14 @@ impl<T: GcLayout> Gc<T> {
             let objptr = baseptr.add(uoff);
             let clonesptr = objptr.sub(size_of::<usize>());
             ptr::write(clonesptr as *mut usize, 1);
-            objptr as *mut T
+            NonNull::new_unchecked(objptr as *mut T)
         }
     }
 
     /// Consumes the `Gc` returning a pointer which can be later used to recreate a `Gc` using
     /// either `from_raw` or `clone_from_raw`. Failing to recreate the `Gc` will lead to a memory
     /// leak.
-    pub fn into_raw(self) -> *const T {
+    pub fn into_raw(self) -> NonNull<T> {
         let objptr = self.objptr;
         forget(self);
         objptr
@@ -72,33 +72,29 @@ impl<T: GcLayout> Gc<T> {
 
     /// Create a `Gc` from a raw pointer previously created by `alloc_blank` or `into_raw`. Note
     /// that this does not increment the reference count.
-    pub unsafe fn from_raw(objptr: *const T) -> Self {
-        Gc {
-            objptr: objptr as *mut T,
-        }
+    pub unsafe fn from_raw(objptr: NonNull<T>) -> Self {
+        Gc { objptr }
     }
 
     /// Create a `Gc` from a raw pointer previously created by `into_raw`, incrementing the
     /// reference count at the same time.
-    pub unsafe fn clone_from_raw(objptr: *const T) -> Self {
-        let clonesptr = (objptr as *mut u8).sub(size_of::<usize>()) as *mut usize;
+    pub unsafe fn clone_from_raw(objptr: NonNull<T>) -> Self {
+        let clonesptr = (objptr.as_ptr() as *mut u8).sub(size_of::<usize>()) as *mut usize;
         let clones = ptr::read(clonesptr);
         ptr::write(clonesptr, clones + 1);
-        Gc {
-            objptr: objptr as *mut T,
-        }
+        Gc { objptr }
     }
 
     /// Recreate the `Gc<T>` pointing to `valptr`. If `valptr` was not originally directly created
     /// by `Gc`/`GcBox` then undefined behaviour will result.
-    pub unsafe fn recover(objptr: *const T) -> Self {
+    pub unsafe fn recover(objptr: NonNull<T>) -> Self {
         Gc::clone_from_raw(objptr)
     }
 
     /// Clone the GC object `gcc`. Note that this is an associated method.
     pub fn clone(gcc: &Gc<T>) -> Self {
         unsafe {
-            let clonesptr = (gcc.objptr as *mut u8).sub(size_of::<usize>()) as *mut usize;
+            let clonesptr = (gcc.objptr.as_ptr() as *mut u8).sub(size_of::<usize>()) as *mut usize;
             let clones = ptr::read(clonesptr);
             ptr::write(clonesptr, clones + 1);
         }
@@ -113,7 +109,7 @@ impl<T: GcLayout> Gc<T> {
     #[cfg(test)]
     fn clones(&self) -> usize {
         unsafe {
-            let clonesptr = (self.objptr as *mut u8).sub(size_of::<usize>()) as *mut usize;
+            let clonesptr = (self.objptr.as_ptr() as *mut u8).sub(size_of::<usize>()) as *mut usize;
             ptr::read(clonesptr)
         }
     }
@@ -123,7 +119,7 @@ impl<T: GcLayout> Deref for Gc<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        unsafe { &*(self.objptr as *const T) }
+        unsafe { self.objptr.as_ref() }
     }
 }
 
@@ -131,12 +127,12 @@ impl<T: GcLayout> Drop for Gc<T> {
     fn drop(&mut self) {
         let t_layout = self.layout();
         unsafe {
-            let clonesptr = (self.objptr as *mut u8).sub(size_of::<usize>()) as *mut usize;
+            let clonesptr = (self.objptr.as_ptr() as *mut u8).sub(size_of::<usize>()) as *mut usize;
             let clones = ptr::read(clonesptr);
             if clones == 1 {
-                ptr::drop_in_place(self.objptr);
+                ptr::drop_in_place(self.objptr.as_ptr());
                 let (layout, uoff) = Layout::new::<usize>().extend(t_layout).unwrap();
-                let baseptr = (self.objptr as *mut u8).sub(uoff);
+                let baseptr = (self.objptr.as_ptr() as *mut u8).sub(uoff);
                 dealloc(baseptr, layout);
             } else {
                 ptr::write(clonesptr, clones - 1)
@@ -171,5 +167,10 @@ mod tests {
             assert_eq!(v2.clones(), 2);
         }
         assert_eq!(v1.clones(), 1);
+    }
+
+    #[test]
+    fn test_gc_nonnull() {
+        assert_eq!(size_of::<Gc<i64>>(), size_of::<Option<Gc<i64>>>());
     }
 }
